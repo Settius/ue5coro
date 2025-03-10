@@ -74,6 +74,7 @@ UE5CORO_API auto UntilCoroutine(TCoroutine<> Coroutine)
  *
  *  Delegates are also co_awaitable without this wrapper.
  *  See the documentation for details on the differences in behavior. */
+[[deprecated("This wrapper is no longer needed.")]]
 auto UntilDelegate(Private::TIsDelegate auto& Delegate)
 	-> Private::FLatentAwaiter;
 
