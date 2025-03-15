@@ -65,8 +65,30 @@ public:
 			[[likely]]
 		{
 			LatentPromise->LatentActionDestroyed();
-			// Process the resulting forced cancellation right away,
-			// there might be no further resumption
+			// This call force-canceled the promise, and unregistered the
+			// pending latent action from it.
+			// Depending on the current awaiter, the following has happened:
+
+			// Nothing: The coroutine is running while the promise is detached.
+			// Running on the game thread prevents this from being called
+			// concurrently. Calling Resume() without a latent action while
+			// detached will reattach the promise and wait for a second Resume(),
+			// which will arrive when the coroutine next co_awaits something.
+			// This might be the return value of final_suspend.
+
+			// TAwaiter: The promise is detached. The awaiter will resume it
+			// eventually, which will serve as the other Resume().
+
+			// TCancelableAwaiter: The promise is detached, and
+			// LatentActionDestroyed() has caused an expedited cancellation.
+			// The awaiter guarantees to schedule exactly one other Resume().
+
+			// FLatentAwaiter: These awaiters will no longer tick with the
+			// latent action gone. The promise is NOT detached, it relies on
+			// being resumed to clean up after itself.
+
+			// In every situation above, Resume() must be called now.
+			// It will either be the only call, or one of two.
 			LatentPromise->Resume();
 		}
 		// CurrentAwaiter is a non-owning copy, disarm its destructor
@@ -253,8 +275,9 @@ void FLatentPromise::Resume()
 void FLatentPromise::LatentActionDestroyed()
 {
 	UE::TUniqueLock Lock(Extras->Lock);
-	LatentAction = nullptr;
-	Cancel();
+	verifyf(std::exchange(LatentAction, nullptr),
+	        TEXT("Internal error: double latent action destruction"));
+	Cancel(true);
 	checkf(ShouldCancel(true),
 	       TEXT("Internal error: forced cancellation not received"));
 }
@@ -264,11 +287,13 @@ void FLatentPromise::CancelFromWithin()
 	// Force move the coroutine back to the game thread
 	AttachToGameThread(true);
 
-	Cancel();
-
-	checkf(ShouldCancel(false),
-	       TEXT("Coroutines may only be canceled from within if no "
-	            "FCancellationGuards are active"));
+	{
+		UE::TUniqueLock Lock(Extras->Lock);
+		Cancel(false);
+		checkf(ShouldCancel(false),
+		       TEXT("Coroutines may only be canceled from within if no "
+		            "FCancellationGuards are active"));
+	}
 
 	// If the self-cancellation arrived on the game thread, don't wait for the
 	// next FPendingLatentCoroutine tick to start cleaning up
@@ -280,17 +305,27 @@ void FLatentPromise::AttachToGameThread(bool bFromAnyThread)
 {
 	checkf(bFromAnyThread || IsInGameThread(),
 	       TEXT("Internal error: expected to be on the game thread"));
+	checkf([this]
+	{
+		UE::TUniqueLock Lock(Extras->Lock);
+		return !CancelableAwaiter;
+	}(), TEXT("Internal error: cannot reattach with a registered awaiter"));
+
 	LatentFlags &= ~LF_Detached;
 }
 
+/** Calling this method "pins" the promise and coroutine state, deferring any
+ *  destruction requests from the latent action manager.
+ *  This is useful for threading or callback-based awaiters to ensure that
+ *  there will be a valid promise and coroutine state to return to.
+ *  FLatentAwaiters use a dedicated code path and do not call this, as they
+ *  support destruction on game thread Tick while being co_awaited. */
 void FLatentPromise::DetachFromGameThread()
 {
-	// Calling this method "pins" the promise and coroutine state, deferring any
-	// destruction requests from the latent action manager.
-	// This is useful for threading or callback-based awaiters to ensure that
-	// there will be a valid promise and coroutine state to return to.
-	// FLatentAwaiters use a dedicated code path and do not call this, as they
-	// support destruction while being co_awaited.
+	// Multiple detachments in a row are OK, but the first one must be on the GT
+	checkf(LatentFlags & LF_Detached || IsInGameThread(),
+	       TEXT("Internal error: expected first detachment on the GT"));
+
 	LatentFlags |= LF_Detached;
 }
 
